@@ -1,0 +1,153 @@
+# When code is pushed, build, push, and scan Docker image, then deploy to 'dev' cluster (or 'test' for main branch).
+name: continuous integration
+on:
+  push:
+    paths:
+      - "src/**"
+      - "Dockerfile*"
+      - "manifest*.yml"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/release.yml"
+      - ".github/containerscan/allowedlist.yaml"
+  workflow_dispatch:
+
+env:
+  NAMESPACE_PREFIX: building-blocks
+  DOCKER_DEV_REGISTRY: docker-dev.registry.kroger.com
+  DOCKER_REPOSITORY: tools/spring-boot-webapp
+  HARNESS_APPLICATION_NAME: webapp-templates
+  HARNESS_PIPELINE_NAME: spring-boot-webapp-k8s
+
+jobs:
+  maven-build: 
+    name: Maven build
+    runs-on: kubernetes
+    container:
+      image: docker-remote.registry.kroger.com/maven:3.6.3-openjdk-8
+    steps:
+      - name: 🛒 Check out commit that trigged workflow
+        uses: actions/checkout@v2
+      - name: Copy custom settings.xml
+        run: curl -o /usr/share/maven/conf/settings.xml https://artifactory.kroger.com/artifactory/kroger-alm/maven/config/settings.xml
+      - name: Cache Maven dependencies
+        uses: actions/cache@v2
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+      - name: Maven clean compile
+        run: mvn clean compiler:compile
+      - uses: actions/upload-artifact@v2
+        with:
+          name: target
+          path: target/
+          retention-days: 1
+
+  sonar-scan:
+    name: Scan code with Sonar
+    needs: [maven-build]
+    runs-on: [self-hosted, kubernetes, on-prem]
+    steps:
+      - name: 🛒 Check out commit that trigged workflow
+        uses: actions/checkout@v2
+      - name: Copy custom actions
+        run: cp -r /actions/* ./.github/actions/
+      - uses: actions/download-artifact@v2
+        with:
+          name: target
+          path: target/
+      - name: Sonar scan
+        uses: ./.github/actions/sonar-scanner
+        with:
+          sonar-token: ${{ secrets.SONAR_TOKEN }}
+
+  docker-build:
+    name: 🐳 Build, scan, and push Docker image
+    needs: [maven-build]
+    runs-on: [self-hosted, kubernetes, on-prem]
+    steps:
+      - name: 🛒 Check out commit that trigged workflow
+        uses: actions/checkout@v2
+      - name: Copy custom actions
+        run: cp -r /actions/* ./.github/actions/
+      - uses: jfrog/setup-jfrog-cli@v1
+      - name: 🐸 Configure JFrog CLI
+        run: |
+          jfrog config add --url=https://artifactory.kroger.com --user=${{ secrets.DOCKER_INT_USERNAME }} --password=${{ secrets.DOCKER_INT_PASSWORD }} --interactive=false artifactory
+      - name: 🐳 🏗 Build Docker image
+        run: |
+          docker pull ${{ env.DOCKER_DEV_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}:latest || true
+          docker build -t ${{ env.DOCKER_DEV_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}:${{ github.sha }} \
+            --build-arg JAR_FILE=./target/*.jar \
+            --label org.opencontainers.image.source=${{ env.GITHUB_SERVER_URL }}/${{ github.repository }} \
+            --label org.opencontainers.image.revision=${{ github.sha }} \
+            --label "org.opencontainers.image.vendor=Kroger Technology" \
+            --label org.opencontainers.image.ref.name=${{ github.ref }} \
+            --cache-from=${{ env.DOCKER_DEV_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}:latest \
+            .
+      - name: 🐸 Push to jfrog Artifactory
+        uses: ./.github/actions/jfrog-docker-push
+        with:
+          images: |
+            ${{ env.DOCKER_DEV_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}:${{ github.sha }}
+          repo: docker-dev
+          server-id: artifactory
+
+  deploy-to-dev:
+    name: 🚀 Deploy to Kubernetes dev
+    needs: [docker-build, sonar-scan]
+    runs-on: [self-hosted, kubernetes, on-prem]
+    if: github.ref != 'refs/heads/main'
+    environment:
+      name: dev
+      url: https://spring-boot-webapp-dev.tooling.rch-cdc-cxnonprod.kroger.com/
+    container: docker-prod.registry.kroger.com/alcatraz/kps-harness-cli:v0.2.2 
+    steps:
+      - name: Execute Harness Pipeline
+        env:
+          HARNESS_API_TOKEN: ${{ secrets.HARNESS_API_TOKEN }}
+        run: |
+          kps-harness execute-pipeline \
+            --application-name ${{ env.HARNESS_APPLICATION_NAME }} \
+            --pipeline-name ${{ env.HARNESS_PIPELINE_NAME }} \
+            --wait true \
+            --service-input '{
+                  "name": "spring-boot-webapp",
+                  "artifactSourceName": "docker-prod_tools_webapp",
+                  "buildNumber": "latest"
+              }'
+            
+  deploy-to-test:
+    name: 🚀 Deploy to Kubernetes test
+    needs: [docker-build, sonar-scan]
+    runs-on: [self-hosted]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: test
+      url: https://spring-boot-webapp-test.tooling.rch-cdc-cxnonprod.kroger.com
+    strategy:
+      matrix:
+        datacenter:
+        - { name: CDC, manifestSuffix: cdc, kubeconfigSecret: 'KUBE_CONFIG_NON_PROD_CDC' }
+        - { name: HDC, manifestSuffix: hdc, kubeconfigSecret: 'KUBE_CONFIG_NON_PROD_HDC' }
+    steps:
+      - name: 🛒 Check out Kubernetes manifest
+        uses: actions/checkout@v2
+      - uses: azure/setup-kubectl@v1
+      - name: 🔐 Set up kubeconfig for ${{ matrix.datacenter.name }}
+        uses: Azure/k8s-set-context@v1
+        with:
+          kubeconfig: ${{ secrets[matrix.datacenter.kubeconfigSecret] }}
+      - uses: azure/k8s-create-secret@v1
+        with:
+          namespace: ${{ env.NAMESPACE_PREFIX }}-test
+          secret-type: 'generic'
+          arguments: --from-literal=application-secret=${{ secrets.WEBAPP_SECRET }}
+          secret-name: webapp-secret
+      - uses: Azure/k8s-deploy@v1.4
+        with:
+          namespace: ${{ env.NAMESPACE_PREFIX }}-test
+          manifests: |
+            k8s/manifest-nonprod.yml
+            k8s/ingress/test-${{ matrix.datacenter.manifestSuffix }}.yml
+          images: |
+            ${{ env.DOCKER_DEV_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}:${{ github.sha }}

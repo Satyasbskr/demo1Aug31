@@ -1,0 +1,54 @@
+# Destroy review app in 'dev' cluster when pull requests close
+name: destroy review app
+on: 
+  workflow_dispatch:
+
+env:
+  NAMESPACE_PREFIX: building-blocks
+
+jobs:
+  destroy-review:
+    name: 🚀 Destroy review app
+    runs-on: [self-hosted]
+    environment:
+      name: review-pr-${{ github.event.pull_request.number }}
+      url: https://webapp-pr-${{ github.event.pull_request.number }}.tooling.rch-cdc-cxnonprod.kroger.com
+    strategy:
+      matrix:
+        datacenter:
+        - { name: CDC, key: cdc, kubeconfigSecret: 'KUBE_CONFIG_NON_PROD_CDC' }
+        - { name: HDC, key: hdc, kubeconfigSecret: 'KUBE_CONFIG_NON_PROD_HDC' }
+    steps:
+      - name: 🛒 Check out Kubernetes manifest
+        uses: actions/checkout@v2
+      - uses: azure/setup-kubectl@v1
+      - name: 🔐 Set up kubeconfig for ${{ matrix.datacenter.name }}
+        uses: Azure/k8s-set-context@v1
+        with:
+          kubeconfig: ${{ secrets[matrix.datacenter.kubeconfigSecret] }}
+      - uses: mshick/fast-envsubst@v1
+        with:
+          in-file: k8s/manifest-review.template.yml
+          out-file: k8s/manifest-review.yml
+        env:
+          NAME: pr-${{ github.event.pull_request.number }}
+          DATACENTER: ${{ matrix.datacenter.key }}
+      - run: |
+          kubectl delete -f k8s/manifest-review.yml -n ${{ env.NAMESPACE_PREFIX }}-dev
+          kubectl delete secret webapp-pr-${{ github.event.pull_request.number }}-secret -n ${{ env.NAMESPACE_PREFIX }}-dev
+
+  destroy-environment:
+    name: 🚀 Destroy review environment
+    runs-on: [ubuntu-latest]
+    needs: [destroy-review]
+    steps:
+      - name: Delete GitHub review-pr-${{ github.event.pull_request.number }} environment
+        uses: actions/github-script@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.request('DELETE /repos/{owner}/{repo}/environments/{environment_name}', {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              environment_name: 'review-pr-${{ github.event.pull_request.number }}'
+            })

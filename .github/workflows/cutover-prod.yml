@@ -1,0 +1,39 @@
+# Manually cutover production traffic to the "green" version
+name: manual cutover production traffic to the "green" version
+on:
+  workflow_dispatch:
+
+env:
+  NAMESPACE: building-blocks
+  DOCKER_PROD_REGISTRY: docker-prod.registry.kroger.com
+  DOCKER_REPOSITORY: tools/webapp
+
+jobs:
+  promote-to-prod:
+    name: 🚀 Promote to Kubernetes prod
+    runs-on: [self-hosted]
+    environment:
+      name: production
+      url: https://webapp.tooling.rch-cdc-cxnonprod.kroger.com
+    strategy:
+      matrix:
+        datacenter:
+        - { name: CDC, manifestSuffix: cdc, kubeconfigSecret: 'KUBE_CONFIG_NON_PROD_CDC' }
+        - { name: HDC, manifestSuffix: hdc, kubeconfigSecret: 'KUBE_CONFIG_NON_PROD_HDC' }
+    steps:
+      - name: 🛒 Check out Kubernetes manifest
+        uses: actions/checkout@v2
+      - uses: azure/setup-kubectl@v1
+      - name: 🔐 Set up kubeconfig for ${{ matrix.datacenter.name }}
+        uses: Azure/k8s-set-context@v1
+        with:
+          kubeconfig: ${{ secrets[matrix.datacenter.kubeconfigSecret] }}
+      - uses: Azure/k8s-deploy@v1.4
+        with:
+          strategy: blue-green
+          route-method: ingress
+          action: promote
+          namespace: ${{ env.NAMESPACE }}
+          manifests: |
+            k8s/manifest.yml
+            k8s/ingress/prod-${{ matrix.datacenter.manifestSuffix }}-green.yml

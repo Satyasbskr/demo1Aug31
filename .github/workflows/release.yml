@@ -1,0 +1,173 @@
+# When a release is published build, push, and scan tagged Docker image, then deploy to 'stage' cluster.
+name: publish and deploy release
+on:
+  release:
+    types: [released]
+
+env:
+  NAMESPACE_PREFIX: building-blocks
+  DOCKER_DEV_REGISTRY: docker-dev.registry.kroger.com
+  DOCKER_REPOSITORY: tools/webapp
+
+jobs:
+  build:
+    name: 🐳 Build, scan, and push Docker image
+    runs-on: [self-hosted]
+    steps:
+      - name: 🛒 Check out commit that trigged workflow
+        uses: actions/checkout@v2
+      # duplicate the login action below to log in to multiple registries
+      - name: 🔐 Log in to Docker local registry # used as cache source and to push built image
+        uses: docker/login-action@v1
+        with:
+          registry: ${{ env.DOCKER_DEV_REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: 🐸 Configure JFrog CLI
+        run: |
+          jfrog config add --url=https://artifactory.kroger.com --user=${{ secrets.DOCKER_USERNAME }} --password=${{ secrets.DOCKER_PASSWORD }} --interactive=false artifactory
+      - name: 🐳 🏗 Build Docker image
+        run: |
+          docker pull ${{ env.DOCKER_DEV_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}:latest || true
+          docker build -t ${{ env.DOCKER_DEV_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}:${{ github.event.release.tag_name }} \
+            --label org.opencontainers.image.source=${{ env.GITHUB_SERVER_URL }}/${{ github.repository }} \
+            --label org.opencontainers.image.version=${{ github.event.release.tag_name }} \
+            --label org.opencontainers.image.revision=${{ github.sha }} \
+            --label "org.opencontainers.image.vendor=Kroger Technology" \
+            --label org.opencontainers.image.ref.name=${{ github.ref }} \
+            --cache-from=${{ env.DOCKER_DEV_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}:latest \
+            .
+          docker tag ${{ env.DOCKER_DEV_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}:${{ github.event.release.tag_name }} ${{ env.DOCKER_DEV_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}:latest
+      - name: 🐸 Push to jfrog Artifactory
+        uses: ./.github/actions/jfrog-docker-push
+        with:
+          images: |
+            docker push ${{ env.DOCKER_DEV_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}:${{ github.event.release.tag_name }}
+            docker push ${{ env.DOCKER_DEV_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}:latest
+          repo: docker-dev
+          server-id: artifactory
+      - name: 🔬 Run Azure container scan # scan for vulnerabilities and best practices
+        uses: azure/container-scan@v0
+        with:
+          image-name: ${{ env.DOCKER_DEV_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}:${{ github.event.release.tag_name }}
+
+  deploy-to-stage:
+    name: 🚀 Deploy to Kubernetes stage
+    needs: [build]
+    runs-on: [self-hosted]
+    if: github.ref != 'refs/heads/main'
+    environment:
+      name: stage
+      url: https://webapp-stage-green.tooling.rch-cdc-cxnonprod.kroger.com
+    strategy:
+      matrix:
+        datacenter:
+        - { name: CDC, manifestSuffix: cdc, kubeconfigSecret: 'KUBE_CONFIG_NON_PROD_CDC' }
+        - { name: HDC, manifestSuffix: hdc, kubeconfigSecret: 'KUBE_CONFIG_NON_PROD_HDC' }
+    steps:
+      - name: 🛒 Check out Kubernetes manifest
+        uses: actions/checkout@v2
+      - uses: azure/setup-kubectl@v1
+      - name: 🔐 Set up kubeconfig for ${{ matrix.datacenter.name }}
+        uses: Azure/k8s-set-context@v1
+        with:
+          kubeconfig: ${{ secrets[matrix.datacenter.kubeconfigSecret] }}
+      - uses: azure/k8s-create-secret@v1
+        with:
+          namespace: ${{ env.NAMESPACE_PREFIX }}-stage
+          secret-type: 'generic'
+          arguments: --from-literal=application-secret=${{ secrets.WEBAPP_SECRET }}
+          secret-name: webapp-secret
+      - uses: Azure/k8s-deploy@v1.4
+        with:
+          strategy: blue-green
+          route-method: ingress
+          namespace: ${{ env.NAMESPACE_PREFIX }}-stage
+          manifests: |
+            k8s/manifest-nonprod.yml
+            k8s/ingress/stage-${{ matrix.datacenter.manifestSuffix }}-green.yml
+          images: |
+            ${{ env.DOCKER_DEV_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}:${{ github.event.release.tag_name }}
+      - uses: Azure/k8s-deploy@v1.4
+        with:
+          namespace: ${{ env.NAMESPACE_PREFIX }}-stage
+          manifests: |
+            k8s/ingress/stage-${{ matrix.datacenter.manifestSuffix }}.yml
+
+  smoketest-stage:
+    name: 🚀 Smoke test Kubernetes stage
+    needs: [build, deploy-to-stage]
+    runs-on: [self-hosted]
+    strategy:
+      matrix:
+        datacenter:
+        - { name: CDC, domain: 'rch-cdc-cxnonprod.kroger.com' }
+        - { name: HDC, domain: 'rch-hdc-cxnonprod.kroger.com' }
+    steps:
+      - name: Smoke test ${{ matrix.datacenter.name }}
+        run: curl --insecure https://webapp-stage-green.tooling.${{ matrix.datacenter.domain }}/bad-url
+
+  promote-to-stage:
+    name: 🚀 Promote to Kubernetes stage
+    needs: [build, deploy-to-stage, smoketest-stage]
+    runs-on: [self-hosted]
+    environment:
+      name: stage
+      url: https://webapp-stage.tooling.rch-cdc-cxnonprod.kroger.com
+    strategy:
+      matrix:
+        datacenter:
+        - { name: CDC, manifestSuffix: cdc, kubeconfigSecret: 'KUBE_CONFIG_NON_PROD_CDC' }
+        - { name: HDC, manifestSuffix: hdc, kubeconfigSecret: 'KUBE_CONFIG_NON_PROD_HDC' }
+    steps:
+      - name: 🛒 Check out Kubernetes manifest
+        uses: actions/checkout@v2
+      - uses: azure/setup-kubectl@v1
+      - name: 🔐 Set up kubeconfig for ${{ matrix.datacenter.name }}
+        uses: Azure/k8s-set-context@v1
+        with:
+          kubeconfig: ${{ secrets[matrix.datacenter.kubeconfigSecret] }}
+      - uses: Azure/k8s-deploy@v1.4
+        with:
+          strategy: blue-green
+          route-method: ingress
+          action: promote
+          namespace: ${{ env.NAMESPACE_PREFIX }}-stage
+          manifests: |
+            k8s/manifest-nonprod.yml
+            k8s/ingress/stage-${{ matrix.datacenter.manifestSuffix }}-green.yml
+          images: |
+            ${{ env.DOCKER_DEV_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}:${{ github.event.release.tag_name }}
+
+  rollback-stage:
+    name: 🚀 Roll back Kubernetes stage
+    needs: [build, deploy-to-stage, smoketest-stage]
+    if: failure()
+    runs-on: [self-hosted]
+    environment:
+      name: stage
+      url: https://webapp-stage.tooling.rch-cdc-cxnonprod.kroger.com
+    strategy:
+      matrix:
+        datacenter:
+        - { name: CDC, manifestSuffix: cdc, kubeconfigSecret: 'KUBE_CONFIG_NON_PROD_CDC' }
+        - { name: HDC, manifestSuffix: hdc, kubeconfigSecret: 'KUBE_CONFIG_NON_PROD_HDC' }
+    steps:
+      - name: 🛒 Check out Kubernetes manifest
+        uses: actions/checkout@v2
+      - uses: azure/setup-kubectl@v1
+      - name: 🔐 Set up kubeconfig for ${{ matrix.datacenter.name }}
+        uses: Azure/k8s-set-context@v1
+        with:
+          kubeconfig: ${{ secrets[matrix.datacenter.kubeconfigSecret] }}
+      - uses: Azure/k8s-deploy@v1.4
+        with:
+          strategy: blue-green
+          route-method: ingress
+          action: reject
+          namespace: ${{ env.NAMESPACE_PREFIX }}-stage
+          manifests: |
+            k8s/manifest-nonprod.yml
+            k8s/ingress/stage-${{ matrix.datacenter.manifestSuffix }}-green.yml
+          images: |
+            ${{ env.DOCKER_DEV_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}:${{ github.event.release.tag_name }}

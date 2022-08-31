@@ -1,0 +1,23 @@
+apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+metadata:
+  name: webapp-ingress
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/server-alias: webapp-stage.kroger.com
+spec:
+  tls:
+    - hosts:
+      #hostname of your application
+      - webapp-stage.tooling.rch-cdc-cxnonprod.kroger.com
+      #certificate secret (created by provisioning)
+      secretName: star-tooling-cdccxnonprod
+  rules:
+    - host: webapp-stage.tooling.rch-cdc-cxnonprod.kroger.com
+      http:
+        paths:
+        - path: /
+          backend:
+            # This assumes http-svc exists and routes to healthy endpoints
+            serviceName: webapp-frontend
+            servicePort: 80

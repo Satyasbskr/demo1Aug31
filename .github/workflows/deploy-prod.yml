@@ -1,0 +1,72 @@
+# Manually promote and deploy a Docker tag to production
+name: manual deploy to production
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Docker tag to deploy to PRODUCTION
+        required: false
+
+env:
+  NAMESPACE: building-blocks
+  DOCKER_PROD_REGISTRY: docker-prod.registry.kroger.com
+  DOCKER_REPOSITORY: tools/webapp
+
+jobs:
+  promote:
+    name: 🐳 Promote Docker tag to prod registry
+    runs-on: [self-hosted]
+    steps:
+      - name: 🏅 Promote Docker image
+        uses: timperman/artifactory-promote-action@v1
+        with:
+          url: https://artifactory.kroger.com
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+          sourceRepo: docker-dev
+          targetRepo: docker-prod
+          dockerRepository: ${{ env.DOCKER_REPOSITORY }}
+          tag: ${{ github.event.inputs.tag }}
+          targetTag: ${{ github.event.inputs.tag }}
+
+  deploy-to-prod:
+    name: 🚀 Deploy to Kubernetes prod
+    needs: [promote]
+    runs-on: [self-hosted]
+    environment:
+      name: production
+      url: https://webapp-green.tooling.rch-cdc-cxnonprod.kroger.com
+    strategy:
+      matrix:
+        datacenter:
+        - { name: CDC, manifestSuffix: cdc, kubeconfigSecret: 'KUBE_CONFIG_NON_PROD_CDC' }
+        - { name: HDC, manifestSuffix: hdc, kubeconfigSecret: 'KUBE_CONFIG_NON_PROD_HDC' }
+    steps:
+      - name: 🛒 Check out Kubernetes manifest
+        uses: actions/checkout@v2
+      - uses: azure/setup-kubectl@v1
+      - name: 🔐 Set up kubeconfig for ${{ matrix.datacenter.name }}
+        uses: Azure/k8s-set-context@v1
+        with:
+          kubeconfig: ${{ secrets[matrix.datacenter.kubeconfigSecret] }}
+      - uses: azure/k8s-create-secret@v1
+        with:
+          namespace: ${{ env.NAMESPACE }}
+          secret-type: 'generic'
+          arguments: --from-literal=application-secret=${{ secrets.WEBAPP_SECRET }}
+          secret-name: webapp-secret
+      - uses: Azure/k8s-deploy@v1.4
+        with:
+          strategy: blue-green
+          route-method: ingress
+          namespace: ${{ env.NAMESPACE }}
+          manifests: |
+            k8s/manifest.yml
+            k8s/ingress/prod-${{ matrix.datacenter.manifestSuffix }}-green.yml
+          images: |
+            ${{ env.DOCKER_DEV_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}:${{ github.event.release.tag_name }}
+      - uses: Azure/k8s-deploy@v1.4
+        with:
+          namespace: ${{ env.NAMESPACE }}
+          manifests: |
+            k8s/ingress/prod-${{ matrix.datacenter.manifestSuffix }}.yml
