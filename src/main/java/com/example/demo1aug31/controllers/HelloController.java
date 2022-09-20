@@ -13,20 +13,22 @@ import java.util.Optional;
 @RequestMapping("/operations")
 public class HelloController {
     private final OrderRepository orderRepository;
+
     @Autowired
     public HelloController(OrderRepository orderRepository) {
         this.orderRepository = orderRepository;
     }
+
     @GetMapping("/{orderId}")
     public ResponseEntity<Order> getOperation(@PathVariable Long orderId) {
-        Optional<Order> getOrder= orderRepository.findById(orderId);
-        if (getOrder.isPresent())
-        {
-            return new ResponseEntity<>(getOrder.get(),HttpStatus.ACCEPTED);
-        }else {
-            return new ResponseEntity<>(null,HttpStatus.BAD_REQUEST);
+        Optional<Order> getOrder = orderRepository.findById(orderId);
+        if (getOrder.isPresent()) {
+            return new ResponseEntity<>(getOrder.get(), HttpStatus.ACCEPTED);
+        } else {
+            return new ResponseEntity<>(null, HttpStatus.BAD_REQUEST);
         }
     }
+
     @PostMapping(
             consumes = MediaType.APPLICATION_JSON_VALUE,
             produces = MediaType.APPLICATION_JSON_VALUE)
@@ -38,12 +40,27 @@ public class HelloController {
             return new ResponseEntity<>(order, HttpStatus.CREATED);
         }
     }
-    @DeleteMapping
-    public String deleteOperation() {
-        return "Delete";
+
+    @DeleteMapping("/{orderId}")
+    public ResponseEntity<Order> deleteOperation(@PathVariable Long orderId) {
+       orderRepository.deleteById(orderId);
+
+            return new ResponseEntity<>(null, HttpStatus.NO_CONTENT);
+        }
+
+
+
+    @PutMapping (path= "/{orderId}",
+            consumes = MediaType.APPLICATION_JSON_VALUE,
+            produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<Order> putOperation(@PathVariable Long orderId, @RequestBody Order newOrder) {
+        Optional<Order> getOrder = orderRepository.findById(orderId);
+        if (getOrder.isPresent()) {
+           orderRepository.save(newOrder);
+            return new ResponseEntity<>(newOrder, HttpStatus.ACCEPTED);
+        } else {
+            return new ResponseEntity<>(null, HttpStatus.BAD_REQUEST);
+        }
     }
-    @PutMapping
-    public String putOperation() {
-        return "Put";
-    }
+
 }
